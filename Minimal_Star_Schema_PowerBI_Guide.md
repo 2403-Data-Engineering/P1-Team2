@@ -165,7 +165,7 @@ PowerBI may only allow one active relationship from `fact_transactions` to `dim_
 
 ---
 
-## Column audit against current Neo4j screenshots
+## Column audit against current Neo4j screenshots (INTERNAL USE ONLY, REMOVE 04/30 THURSDAY) 
 
 ### Account screenshot keys
 
