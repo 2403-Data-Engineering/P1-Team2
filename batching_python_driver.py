@@ -9,18 +9,15 @@ Final exported tables/folders:
   - dim_transaction_type
   - dim_date
 
-This version intentionally does NOT add extra helper/bridge/summary tables.
-It only adds project-specific account node properties to dim_account because the
-team's Cypher writes the fraud outputs mostly as Account properties:
-  community_id, indegree, outdegree,
-  fan_out_flag, fan_in_flag, drain_flag, transfer_cashout_flag,
-  dense_community_flag, cycles_flag, association_flag, ringtoring_flag,
-  risk_score
+This version keeps the trainer's table count small, but it batches BOTH:
+  - dim_account
+  - fact_transactions
 
-The transaction fact table remains close to the trainer template:
-  nameOrig, nameDest, step, type, amount,
-  oldbalanceOrg, newbalanceOrig, oldbalanceDest, newbalanceDest,
-  date as the partition column after joining dim_date.
+Why this patched version exists:
+  Full PaySim-style graphs can contain millions of Account nodes. Pulling all
+  accounts into one Python list and then calling spark.createDataFrame(...) can
+  crash with Java heap space errors. This version writes dim_account in batches
+  exactly like fact_transactions, so memory stays bounded.
 
 Run:
   python batching_python_driver.py
@@ -32,6 +29,8 @@ Optional environment variables:
   OUTPUT_DIR=./Output_Parquet
   START_DATE=2026-03-01
   BATCH_SIZE=25000
+  ACCOUNT_BATCH_SIZE=25000
+  SPARK_DRIVER_MEMORY=4g
 """
 
 import os
@@ -58,11 +57,11 @@ from pyspark.sql.types import (
 
 # -----------------------------------------------------------------------------
 # Config
-# TODO: MAKE SURE YOU CONFIRM THESE DETAILS, AS WELL AS THE OUTPUT FOLDERS ETC...
 # -----------------------------------------------------------------------------
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  # optional; leave unset for default DB
 
 # PaySim step = hour number. This start date is artificial and only exists so
 # PowerBI can use normal date slicers/axes.
@@ -70,6 +69,8 @@ START_DATE = datetime.strptime(os.getenv("START_DATE", "2026-03-01"), "%Y-%m-%d"
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./Output_Parquet"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25000"))
+ACCOUNT_BATCH_SIZE = int(os.getenv("ACCOUNT_BATCH_SIZE", str(BATCH_SIZE)))
+SPARK_DRIVER_MEMORY = os.getenv("SPARK_DRIVER_MEMORY", "4g")
 
 # -----------------------------------------------------------------------------
 # Small conversion helpers
@@ -97,10 +98,15 @@ def safe_str(value: Any, default: str = "") -> str:
         return default
     return str(value)
 
+
+def session_kwargs() -> dict:
+    """Pass database only when supplied, so this works with default Neo4j setups."""
+    return {"database": NEO4J_DATABASE} if NEO4J_DATABASE else {}
+
 # -----------------------------------------------------------------------------
 # Schemas — keep in sync with the Cypher RETURN clauses and row tuples.
 # -----------------------------------------------------------------------------
-ACCOUNT_SCHEMA = StructType([
+ACCOUNT_BATCH_SCHEMA = StructType([
     StructField("account_id", StringType(), False),
     StructField("community_id", StringType(), True),
     StructField("indegree", IntegerType(), True),
@@ -146,6 +152,8 @@ DIM_DATE_SCHEMA = StructType([
 # -----------------------------------------------------------------------------
 # Cypher queries
 # -----------------------------------------------------------------------------
+# Stream Account nodes with a single query and Neo4j driver fetch_size.
+# Do NOT ORDER BY here; sorting millions of accounts is slow and unnecessary.
 ACCOUNTS_QUERY = """
 MATCH (a:Account)
 RETURN
@@ -162,7 +170,6 @@ RETURN
   coalesce(a.association_flag, 0) AS association_flag,
   coalesce(a.ringtoring_flag, 0) AS ringtoring_flag,
   coalesce(a.risk_score, 0.0) AS risk_score
-ORDER BY a.id
 """
 
 TRANSACTIONS_QUERY = """
@@ -186,12 +193,24 @@ LIMIT $batch_size
 # -----------------------------------------------------------------------------
 # Read/write functions
 # -----------------------------------------------------------------------------
-def fetch_accounts(driver):
-    print("Fetching accounts for dim_account...")
-    with driver.session() as session:
+def stream_accounts_to_parquet(driver, spark, output_path):
+    """
+    Read Account nodes through the Neo4j driver's streaming result and write
+    each ACCOUNT_BATCH_SIZE chunk to dim_account. This avoids materializing
+    millions of accounts in one Python list and avoids a huge Spark driver heap
+    serialization step.
+    """
+    batch_num = 0
+    total_rows = 0
+    batch = []
+
+    print(f"Streaming accounts for dim_account in batches of {ACCOUNT_BATCH_SIZE}...")
+
+    with driver.session(fetch_size=ACCOUNT_BATCH_SIZE, **session_kwargs()) as session:
         result = session.run(ACCOUNTS_QUERY)
-        rows = [
-            (
+
+        for r in result:
+            batch.append((
                 safe_str(r["account_id"]),
                 safe_str(r["community_id"]),
                 safe_int(r["indegree"]),
@@ -205,22 +224,34 @@ def fetch_accounts(driver):
                 safe_int(r["association_flag"]),
                 safe_int(r["ringtoring_flag"]),
                 safe_float(r["risk_score"], 0.0),
+            ))
+
+            if len(batch) >= ACCOUNT_BATCH_SIZE:
+                df = spark.createDataFrame(batch, schema=ACCOUNT_BATCH_SCHEMA)
+                write_mode = "overwrite" if batch_num == 0 else "append"
+                (
+                    df.write.mode(write_mode)
+                    .option("compression", "snappy")
+                    .parquet(str(output_path))
+                )
+                batch_num += 1
+                total_rows += len(batch)
+                print(f"  account batch {batch_num}: {len(batch)} rows (total: {total_rows})")
+                batch = []
+
+        if batch:
+            df = spark.createDataFrame(batch, schema=ACCOUNT_BATCH_SCHEMA)
+            write_mode = "overwrite" if batch_num == 0 else "append"
+            (
+                df.write.mode(write_mode)
+                .option("compression", "snappy")
+                .parquet(str(output_path))
             )
-            for r in result
-        ]
-    print(f"  Got {len(rows)} accounts")
-    return rows
+            batch_num += 1
+            total_rows += len(batch)
+            print(f"  account batch {batch_num}: {len(batch)} rows (total: {total_rows})")
 
-
-def write_dim_account(spark, account_rows, output_path):
-    print("Writing dim_account...")
-    df = spark.createDataFrame(account_rows, schema=ACCOUNT_SCHEMA)
-    (
-        df.coalesce(1)
-        .write.mode("overwrite")
-        .option("compression", "snappy")
-        .parquet(str(output_path))
-    )
+    print(f"Done streaming dim_account. {total_rows} accounts written across {batch_num} batches.")
 
 
 def stream_transactions_to_parquet(driver, spark, output_path):
@@ -238,7 +269,7 @@ def stream_transactions_to_parquet(driver, spark, output_path):
     print(f"Streaming transactions in batches of {BATCH_SIZE}...")
 
     while True:
-        with driver.session() as session:
+        with driver.session(**session_kwargs()) as session:
             result = session.run(
                 TRANSACTIONS_QUERY,
                 last_cursor=last_cursor,
@@ -278,7 +309,7 @@ def stream_transactions_to_parquet(driver, spark, output_path):
         last_cursor = batch[-1][0]
         batch_num += 1
         total_rows += len(batch)
-        print(f"  batch {batch_num}: {len(batch)} rows (total: {total_rows})")
+        print(f"  transaction batch {batch_num}: {len(batch)} rows (total: {total_rows})")
 
     print(f"Done streaming. {total_rows} transactions written across {batch_num} batches.")
     return seen_types, max_step
@@ -343,12 +374,17 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"Connecting to {NEO4J_URI}...")
+    if NEO4J_DATABASE:
+        print(f"Using Neo4j database: {NEO4J_DATABASE}")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
     print("Starting Spark session...")
     spark = (
         SparkSession.builder
-        .appName("neo4j-to-parquet-minimal-star-schema")
+        .master(os.getenv("SPARK_MASTER", "local[*]"))
+        .appName("neo4j-to-parquet-minimal-star-schema-batched-accounts")
+        .config("spark.driver.memory", SPARK_DRIVER_MEMORY)
+        .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "8"))
         .getOrCreate()
     )
 
@@ -359,11 +395,9 @@ def main():
     fact_final_path = OUTPUT_DIR / "fact_transactions"
 
     try:
-        accounts = fetch_accounts(driver)
-        write_dim_account(spark, accounts, dim_account_path)
+        stream_accounts_to_parquet(driver, spark, dim_account_path)
 
         seen_types, max_step = stream_transactions_to_parquet(driver, spark, fact_raw_path)
-        driver.close()
 
         write_dim_transaction_type(spark, seen_types, dim_type_path)
         write_dim_date(spark, max_step, dim_date_path)
